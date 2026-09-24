@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Black Hole · Version 3</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --space: #02020a;
+    --panel: rgba(14, 10, 20, 0.62);
+    --edge: rgba(255, 164, 84, 0.22);
+    --text: #f4e6d4;
+    --muted: #a8977f;
+    --accent: #ff9a3c;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --panel: rgba(14, 10, 20, 0.62); --text: #f4e6d4; }
+  }
+  :root[data-theme="dark"] { --panel: rgba(14, 10, 20, 0.62); --text: #f4e6d4; }
+  *, *::before, *::after { box-sizing: inherit; }
+  html, body { height: 100%; margin: 0; overflow: hidden; background: var(--space); color: var(--text);
+    font-family: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { position: fixed; inset: 0; display: block; cursor: none; touch-action: none; }
+
+  .panel {
+    position: fixed; left: 16px; bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    width: min(280px, calc(100% - 32px));
+    padding: 16px 18px 14px; border-radius: 14px;
+    background: var(--panel); border: 1px solid var(--edge);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  }
+  .row { margin-bottom: 12px; }
+  .row label { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .row label output { color: var(--text); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+  .count { font-size: 13px; color: var(--muted); display: flex; justify-content: space-between; border-top: 1px solid var(--edge); padding-top: 10px; }
+  .count b { color: var(--accent); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+  .hint {
+    position: fixed; left: 0; right: 0; top: calc(28px + env(safe-area-inset-top, 0px));
+    text-align: center; font-size: 15px; color: var(--muted); letter-spacing: 0.02em;
+    pointer-events: none; transition: opacity 1.2s ease;
+  }
+  .hint.gone { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<p class="hint" id="hint">Hold to grow a rock, drag to shape it, release to throw it</p>
+
+<div class="panel">
+  <div class="row">
+    <label for="size">Size <output id="sizeOut">70</output></label>
+    <input id="size" type="range" min="20" max="140" value="70">
+  </div>
+  <div class="row">
+    <label for="spin">Spin speed <output id="spinOut">1.0×</output></label>
+    <input id="spin" type="range" min="0" max="4" step="0.1" value="1">
+  </div>
+  <div class="count"><span>Rocks swallowed</span><b id="count">0</b></div>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const sizeIn = document.getElementById('size'), spinIn = document.getElementById('spin');
+  const sizeOut = document.getElementById('sizeOut'), spinOut = document.getElementById('spinOut');
+  const countEl = document.getElementById('count'), hint = document.getElementById('hint');
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  let W, H, cx, cy, DPR;
+  let R = 70, targetR = 70, spin = 1;
+  let stars = [], disk = [], rocks = [], debris = [], splashes = [], arcs = [];
+  let flash = 0, swallowed = 0, time = 0;
+  const MIN_ROCK = 4, MAX_ROCK = 30, GROW_TIME = 2.5;
+  const ptr = { x: -200, y: -200, sx: -200, sy: -200, over: false, type: 'mouse' };
+  let charge = null, intake = [], bursts = [], cursorSpin = 0;
+  let dust = [], sparks = [], nebulae = [], meteors = [], meteorTimer = 3;
+  const DUST_MAX = 110;
+
+  const TAU = Math.PI * 2;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const mix = (a, b, t) => a + (b - a) * t;
+  const MU = () => 3300 * R * R;           // gravitational strength scales with size
+
+  // ---------- setup ----------
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = innerWidth; H = innerHeight;
+    cv.width = W * DPR; cv.height = H * DPR;
+    cv.style.width = W + 'px'; cv.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    cx = W / 2; cy = H / 2;
+    const maxR = Math.max(30, Math.round(Math.min(W, H) / 7.5));
+    sizeIn.max = Math.min(140, maxR);
+    if (+sizeIn.value > +sizeIn.max) sizeIn.value = sizeIn.max;
+    targetR = +sizeIn.value; sizeOut.textContent = targetR;
+    makeStars();
+  }
+
+  function makeStars() {
+    stars = [];
+    const maxR = Math.hypot(W, H) / 2 * 1.08;
+    const n = Math.round((Math.PI * maxR * maxR) / 2200);
+    const tints = ['255,255,255', '200,215,255', '255,236,200', '255,210,180'];
+    for (let i = 0; i < n; i++) {
+      const sz = Math.pow(Math.random(), 3) * 1.5 + 0.35;
+      stars.push({
+        rad: Math.sqrt(Math.random()) * maxR, ang: rand(0, TAU), depth: sz / 1.85,
+        dx: 0, dy: 0, s: sz,
+        p: rand(0, TAU), sp: rand(0.4, 2.2),
+        c: tints[(Math.random() * tints.length) | 0]
+      });
+    }
+    nebulae = [];
+    const cols = ['90,50,140', '40,70,150', '150,60,40', '70,40,110', '30,90,120'];
+    for (let i = 0; i < 5; i++) {
+      nebulae.push({
+        rad: rand(0.25, 0.9) * maxR, ang: rand(0, TAU), size: rand(0.35, 0.7) * Math.max(W, H),
+        c: cols[i], a: rand(0.05, 0.09), ph: rand(0, TAU), sp: rand(0.05, 0.12)
+      });
+    }
+  }
+
+  function newDust(anywhere) {
+    const far = Math.max(W, H) * 0.62;
+    const d = anywhere ? rand(R * 1.5, far) : rand(Math.max(R * 4, far * 0.75), far);
+    return {
+      dist: d, ang: rand(0, TAU), x: 0, y: 0, s: rand(0.5, 1.6),
+      speed: rand(0.6, 0.95), heat: 0, trail: [], age: anywhere ? 99 : 0,
+      g: rand(0.7, 1.1)
+    };
+  }
+
+  function makeDisk() {
+    disk = [];
+    for (let i = 0; i < 460; i++) {
+      const u = Math.random();
+      disk.push({
+        r: 1.32 + Math.pow(u, 1.7) * 2.2,       // in units of R
+        a: rand(0, TAU), len: rand(0.04, 0.4),
+        w: rand(0.5, 2.4), b: rand(0.25, 1)
+      });
+    }
+  }
+
+  function diskColor(r, alpha) {
+    const t = clamp((r - 1.32) / 2.2, 0, 1);
+    let cr, cg, cb;
+    if (t < 0.35) { const k = t / 0.35; cr = 255; cg = mix(244, 170, k); cb = mix(214, 80, k); }
+    else { const k = (t - 0.35) / 0.65; cr = mix(255, 190, k); cg = mix(170, 55, k); cb = mix(80, 20, k); }
+    return `rgba(${cr | 0},${cg | 0},${cb | 0},${alpha})`;
+  }
+
+  // ---------- rocks ----------
+  function makeRockShape() {
+    const n = 7 + (Math.random() * 5) | 0, verts = [];
+    for (let i = 0; i < n; i++) verts.push({ a: (i / n) * TAU, r: rand(0.65, 1.15) });
+    return verts;
+  }
+
+  // round rock from polar verts, in local coordinates
+  function roundPts(verts, size) {
+    return verts.map(v => [Math.cos(v.a) * v.r * size, Math.sin(v.a) * v.r * size]);
+  }
+
+  // rock outline built around the dragged path: overall shape follows the stroke, edges are jagged
+  function strokeShape(path, thick) {
+    // light smoothing so a shaky hand still gives clean overall shape
+    const P = path.map((p, i) => {
+      const a = path[Math.max(0, i - 1)], b = path[Math.min(path.length - 1, i + 1)];
+      return { x: (a.x + p.x * 2 + b.x) / 4, y: (a.y + p.y * 2 + b.y) / 4, n1: p.n1, n2: p.n2 };
+    });
+    const n = P.length, left = [], right = [];
+    // lumpy (low-frequency) bumps with a little fine grit on top
+    const lump = key => P.map((_, i) => {
+      let sum = 0, c = 0;
+      for (let j = Math.max(0, i - 2); j <= Math.min(n - 1, i + 2); j++) { sum += P[j][key]; c++; }
+      return clamp((sum / c - 0.5) * 2.2 + 0.5, 0, 1) * 0.8 + P[i][key] * 0.2;
+    });
+    const L1 = lump('n1'), L2 = lump('n2');
+    P.forEach((p, i) => { p.n1 = L1[i]; p.n2 = L2[i]; });
+    const nrm = i => {
+      const a = P[Math.max(0, i - 1)], b = P[Math.min(n - 1, i + 1)];
+      const dx = b.x - a.x, dy = b.y - a.y, l = Math.hypot(dx, dy) || 1;
+      return [-dy / l, dx / l];
+    };
+    const width = i => thick * (0.7 + 0.3 * Math.pow(Math.sin(Math.PI * (i / (n - 1))), 0.5));
+    for (let i = 0; i < n; i++) {
+      const [nx, ny] = nrm(i), w = width(i);
+      const wl = w * (0.78 + 0.44 * P[i].n1), wr = w * (0.78 + 0.44 * P[i].n2);
+      left.push([P[i].x + nx * wl, P[i].y + ny * wl]);
+      right.push([P[i].x - nx * wr, P[i].y - ny * wr]);
+    }
+    const cap = (i, from, jag) => {                   // rounded, bumpy end caps
+      const [nx, ny] = nrm(i), w = width(i), a0 = Math.atan2(ny, nx), pts = [];
+      for (let k = 1; k < 6; k++) {
+        const a = a0 + from * (k / 6) * Math.PI, rr = w * (0.8 + 0.35 * jag[k % jag.length]);
+        pts.push([P[i].x + Math.cos(a) * rr, P[i].y + Math.sin(a) * rr]);
+      }
+      return pts;
+    };
+    const outline = left
+      .concat(cap(n - 1, -1, [P[n - 1].n1, P[n - 1].n2, P[0].n1]))
+      .concat(right.reverse())
+      .concat(cap(0, -1, [P[0].n2, P[0].n1, P[n - 1].n2]).map(([x, y]) => [x, y]));
+    // the start cap goes from right side back to left side
+    const startCap = (() => {
+      const [nx, ny] = nrm(0), w = width(0), a0 = Math.atan2(-ny, -nx), pts = [];
+      for (let k = 1; k < 6; k++) {
+        const a = a0 - (k / 6) * Math.PI, rr = w * (0.8 + 0.35 * [P[0].n2, P[0].n1, P[1 % n].n2][k % 3]);
+        pts.push([P[0].x + Math.cos(a) * rr, P[0].y + Math.sin(a) * rr]);
+      }
+      return pts;
+    })();
+    outline.splice(outline.length - 5, 5, ...startCap);
+    // centroid + area (shoelace)
+    let A = 0, gx = 0, gy = 0;
+    for (let i = 0; i < outline.length; i++) {
+      const [x0, y0] = outline[i], [x1, y1] = outline[(i + 1) % outline.length];
+      const c = x0 * y1 - x1 * y0; A += c; gx += (x0 + x1) * c; gy += (y0 + y1) * c;
+    }
+    A /= 2; gx /= 6 * A; gy /= 6 * A;
+    return { pts: outline.map(([x, y]) => [x - gx, y - gy]), spine: P.map(p => [p.x - gx, p.y - gy]), x: gx, y: gy, area: Math.abs(A) };
+  }
+
+  function pathLength(path) {
+    let L = 0;
+    for (let i = 1; i < path.length; i++) L += Math.hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
+    return L;
+  }
+
+  function refreshCharge() {
+    const c = charge;
+    if (pathLength(c.path) < 10) {
+      c.shaped = false;
+      c.x = c.path[0].x; c.y = c.path[0].y;
+      c.pts = roundPts(c.verts, c.size); c.hl = c.size;
+      c.emit = [[0, 0]]; c.tw = c.size;
+    } else {
+      c.shaped = true; c.rot = 0;
+      const sh = strokeShape(c.path, Math.max(4.5, c.size * 0.85));
+      c.x = sh.x; c.y = sh.y; c.pts = sh.pts;
+      c.hl = Math.max(4, Math.min(45, Math.sqrt(sh.area / Math.PI)));
+      const thick = Math.max(4.5, c.size * 0.85), sp = sh.spine;
+      const k = clamp(Math.round(pathLength(c.path) / (thick * 1.6 + 10)) + 1, 2, 9);
+      c.emit = [];
+      for (let j = 0; j < k; j++) c.emit.push(sp[Math.round((j / (k - 1)) * (sp.length - 1))]);
+      c.tw = thick;
+    }
+  }
+
+  // Tidal stretch geometry. The back of the rock (the side facing away from the hole)
+  // stays where it is; only the front is pulled out toward the hole.
+  function rockGeom(r) {
+    const dx = r.x - cx, dy = r.y - cy, d = Math.hypot(dx, dy) || 1, radial = Math.atan2(dy, dx);
+    const th = r.rot - radial, c = Math.cos(th), sn = Math.sin(th);
+    let outer = -1e9, inner = 1e9;
+    for (const [x, y] of r.pts) { const xr = x * c - y * sn; if (xr > outer) outer = xr; if (xr < inner) inner = xr; }
+    const len = Math.max(1, outer - inner);
+    let stretch = 1 + Math.min(4, 3 * Math.pow(R * 1.5 / d, 4));
+    stretch = Math.min(stretch, Math.max(1, (d + outer) / len));   // front never reaches past the centre
+    return { d, radial, outer, stretch, tip: d + outer - len * stretch, back: d + outer };
+  }
+
+  function longAxis(pts) {
+    let sxx = 0, syy = 0, sxy = 0;
+    for (const [x, y] of pts) { sxx += x * x; syy += y * y; sxy += x * y; }
+    return 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  }
+
+  function rockToWorld(r, g, x, y) {
+    const th = r.rot - g.radial, c = Math.cos(th), sn = Math.sin(th);
+    let xr = x * c - y * sn, yr = x * sn + y * c;
+    xr = g.outer + (xr - g.outer) * g.stretch; yr /= Math.sqrt(g.stretch);
+    const cr = Math.cos(g.radial), sr = Math.sin(g.radial);
+    return [r.x + xr * cr - yr * sr, r.y + xr * sr + yr * cr];
+  }
+
+  function spawnRock(x, y, size, pts, rot, shade) {
+    const dx = x - cx, dy = y - cy, d = Math.hypot(dx, dy) || 1;
+    rocks.push({
+      x, y, vx: 0, vy: 0,
+      dist: d, ang: Math.atan2(dy, dx), age: 0,
+      pts, size, rot, vr: rand(-4, 4) * (8 / (size + 4)),   // big rocks tumble slower
+      axis: longAxis(pts),
+      shade, trails: [], emit: [[0, 0]], tw: size, heat: 0
+    });
+    hint.classList.add('gone');
+  }
+
+  function consume(r) {
+    const ang = Math.atan2(r.y - cy, r.x - cx);
+    const hx = cx + Math.cos(ang) * R, hy = cy + Math.sin(ang) * R;
+    splashes.push({ x: hx, y: hy, t: 0, size: r.size });
+    arcs.push({ a: ang, t: 0, size: r.size });
+    const count = reduceMotion ? 8 : Math.min(70, Math.round(12 + r.size * 1.8));
+    for (let i = 0; i < count; i++) {
+      const a = ang + rand(-1.3, 1.3), sp = rand(60, 260) * (0.8 + r.size / 25);
+      debris.push({
+        x: hx, y: hy, vx: Math.cos(a) * sp + r.vx * 0.25, vy: Math.sin(a) * sp + r.vy * 0.25,
+        life: rand(0.6, 1.6), max: 1.6, s: rand(0.8, 2.2), hot: Math.random()
+      });
+    }
+    flash = Math.min(1, 0.35 + r.size / 14);
+    swallowed++; countEl.textContent = swallowed;
+  }
+
+  function gravityStep(o, h, dragBase) {
+    const dx = cx - o.x, dy = cy - o.y;
+    const d2 = dx * dx + dy * dy, d = Math.sqrt(d2);
+    const mu = MU();
+    let ax = mu * dx / (d2 * d), ay = mu * dy / (d2 * d);
+    // frame dragging: spinning hole drags nearby matter around with it
+    const drag = spin * mu / d2 * 0.35 * (R / d);
+    ax += (dy / d) * drag; ay += (-dx / d) * drag;
+    const k = dragBase + 1.1 * (R / d) * (R / d);
+    o.vx += ax * h; o.vy += ay * h;
+    o.vx *= 1 - k * h; o.vy *= 1 - k * h;
+    o.x += o.vx * h; o.y += o.vy * h;
+    return d;
+  }
+
+  // one-way inward spiral used by rocks and dust
+  function spiral(o, h, ramp, fallMul) {
+    const d = o.dist, q = R / d;
+    const omega = Math.sqrt(MU() / (d * d * d)) * 0.85 * (1 + 0.2 * spin * q) * ramp;
+    const inRing = d < R * 3.55 ? 1 : 0;
+    const fall = R * (0.3 + 1.6 * q * q + inRing * 0.35) * (0.7 + 0.15 * spin) * ramp * fallMul;
+    o.ang += omega * h;
+    o.dist = Math.max(0, d - fall * h);
+  }
+
+  // ---------- shooting stars ----------
+  function spawnMeteor() {
+    // enter from a point just off-screen, aimed past the hole with a random miss distance
+    const edge = Math.hypot(W, H) / 2 + 40;
+    const a = rand(0, TAU);
+    const x = cx + Math.cos(a) * edge, y = cy + Math.sin(a) * edge;
+    const miss = (Math.random() < 0.5 ? -1 : 1) * rand(0.12, 0.62) * Math.min(W, H);
+    const tx = -Math.sin(a), ty = Math.cos(a);                 // sideways offset direction
+    const aimX = cx + tx * miss, aimY = cy + ty * miss;
+    const dx = aimX - x, dy = aimY - y, d = Math.hypot(dx, dy);
+    const sp = rand(520, 760);
+    meteors.push({ x, y, vx: dx / d * sp, vy: dy / d * sp, t: 0, trail: [], captured: false, heat: 0, fade: 1 });
+  }
+
+  function meteorImpact(m) {
+    const ang = Math.atan2(m.y - cy, m.x - cx);
+    const hx = cx + Math.cos(ang) * R, hy = cy + Math.sin(ang) * R;
+    splashes.push({ x: hx, y: hy, t: 0, size: 6 });
+    arcs.push({ a: ang, t: 0, size: 7 });
+    const count = reduceMotion ? 6 : 16;
+    for (let i = 0; i < count; i++) {
+      const a = ang + rand(-1.2, 1.2), v = rand(60, 220);
+      debris.push({ x: hx, y: hy, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rand(0.5, 1.3), max: 1.3, s: rand(0.7, 1.8), hot: Math.random() });
+    }
+    flash = Math.max(flash, 0.7);
+  }
+
+  function updateMeteors(dt) {
+    const ringOuter = R * 3.55, mu = MU();
+    for (let i = meteors.length - 1; i >= 0; i--) {
+      const m = meteors[i];
+      m.t += dt;
+      const SUB = 4, h = dt / SUB;
+      let dead = false;
+      for (let s = 0; s < SUB; s++) {
+        const dx = cx - m.x, dy = cy - m.y, d = Math.hypot(dx, dy);
+        if (!m.captured && d < ringOuter) {
+          // switch to polar motion: keep current radial/tangential speed, then plunge
+          m.captured = true;
+          const rx = -dx / d, ry = -dy / d;                   // outward unit vector
+          m.dist = d; m.ang = Math.atan2(ry, rx);
+          m.vr = clamp(m.vx * rx + m.vy * ry, -220, -90);        // radial speed (negative = inward)
+          m.vt = m.vx * -ry + m.vy * rx;                       // tangential speed (disk direction positive)
+        }
+        if (!m.captured) {
+          // free flight: exaggerated gravity so paths visibly bend around the hole
+          const g = Math.min(1800, mu / (d * d) * 4);
+          m.vx += dx / d * g * h; m.vy += dy / d * g * h;
+          m.x += m.vx * h; m.y += m.vy * h;
+        } else {
+          const q = R / m.dist;
+          const vtTarget = Math.sqrt(mu / m.dist) * 1.6 * (1 + 0.2 * spin);
+          m.vt += (vtTarget - m.vt) * Math.min(1, 6 * h);    // swing into the ring's rotation
+          m.vr -= (120 + 700 * q * q) * (0.8 + 0.1 * spin) * h; // inward pull only ever grows
+          m.dist += m.vr * h;
+          m.ang += (m.vt / Math.max(m.dist, 1)) * h;
+          m.x = cx + Math.cos(m.ang) * m.dist; m.y = cy + Math.sin(m.ang) * m.dist;
+          if (m.dist <= R) { dead = true; break; }
+        }
+      }
+      const dNow = Math.hypot(m.x - cx, m.y - cy);
+      m.heat = clamp((R * 3.6 / dNow - 1) / 2, 0, 1);
+      m.trail.push(m.x, m.y);
+      if (m.trail.length > 44) m.trail.splice(0, 2);
+      if (dead) { meteorImpact(m); meteors.splice(i, 1); continue; }
+      const off = m.x < -150 || m.x > W + 150 || m.y < -150 || m.y > H + 150;
+      if (!m.captured && off && m.t > 0.5) meteors.splice(i, 1);
+    }
+  }
+
+  // ---------- update ----------
+  function update(dt) {
+    R += (targetR - R) * Math.min(1, dt * 6);
+    for (const p of disk) p.a += dt * (0.12 + spin * 0.9) * Math.pow(1.32 / p.r, 1.5) * (spin === 0 ? 0 : 1);
+
+    // Rocks follow a one-way inward spiral: distance can only shrink, so nothing escapes.
+    const SUB = 5, h = dt / SUB, mu = MU();
+    for (let i = rocks.length - 1; i >= 0; i--) {
+      const r = rocks[i];
+      r.age += dt;
+      const ramp = Math.min(1, Math.pow(r.age / 2.0, 1.5));   // starts at rest, picks up speed
+      const px = r.x, py = r.y;
+      for (let s = 0; s < SUB; s++) {
+        const d = Math.max(r.dist, R * 0.6), q = R / d;
+        // orbital speed: faster closer in, plus extra swirl from the hole's spin
+        const omega = Math.sqrt(mu / (d * d * d)) * 0.85 * (1 + 0.2 * spin * q) * ramp;
+        // inward fall: gentle far away, much stronger once inside the ring
+        const inRing = d < R * 3.55 ? 1 : 0;
+        const fall = R * (0.3 + 1.6 * q * q + inRing * 0.35) * (0.7 + 0.15 * spin) * ramp;
+        r.ang += omega * h;
+        r.dist = Math.max(0, r.dist - fall * h);
+      }
+      r.x = cx + Math.cos(r.ang) * r.dist;
+      r.y = cy + Math.sin(r.ang) * r.dist;
+      r.vx = (r.x - px) / dt; r.vy = (r.y - py) / dt;
+      const tidal = clamp(R * 2.8 / r.dist - 1, 0, 1);
+      r.vr *= 1 - Math.min(1, tidal * 4 * dt);
+      r.rot += r.vr * dt;
+      if (tidal > 0) {
+        let diff = (r.ang - (r.axis + r.rot)) % Math.PI;          // align long axis with the radial line
+        if (diff > Math.PI / 2) diff -= Math.PI; if (diff < -Math.PI / 2) diff += Math.PI;
+        r.rot += diff * Math.min(1, tidal * 1.2 * dt);
+      }
+      let geo = rockGeom(r);
+      // once stretching starts, the back edge may only ever move closer to the hole
+      if (geo.stretch > 1.02) {
+        if (r.backLimit === undefined) r.backLimit = geo.back;
+        if (geo.back > r.backLimit) {
+          r.dist = Math.max(0, r.dist - (geo.back - r.backLimit));
+          r.x = cx + Math.cos(r.ang) * r.dist; r.y = cy + Math.sin(r.ang) * r.dist;
+          geo = rockGeom(r);
+        }
+        r.backLimit = Math.min(r.backLimit, geo.back);
+      }
+      if (!r.hit && geo.tip <= R) { r.hit = true; consume(r); }          // front touches the surface
+      if (geo.back <= R || r.dist <= 0) { rocks.splice(i, 1); continue; } // whole rock has gone in
+      r.heat = clamp((R * 3.2 / r.dist - 1) / 2.2, 0, 1);
+      const maxPts = r.emit.length > 1 ? 40 : 56;
+      r.emit.forEach(([ex, ey], j) => {
+        const tr = r.trails[j] || (r.trails[j] = []);
+        const [wx, wy] = rockToWorld(r, geo, ex, ey);
+        tr.push(wx, wy);
+        if (tr.length > maxPts) tr.splice(0, 2);
+      });
+    }
+
+    for (let i = debris.length - 1; i >= 0; i--) {
+      const p = debris[i];
+      p.life -= dt;
+      let gone = p.life <= 0;
+      for (let s = 0; s < 3 && !gone; s++) if (gravityStep(p, dt / 3, 0.6) <= R) gone = true;
+      if (gone) debris.splice(i, 1);
+    }
+    for (let i = splashes.length - 1; i >= 0; i--) { splashes[i].t += dt; if (splashes[i].t > 0.8) splashes.splice(i, 1); }
+    for (let i = arcs.length - 1; i >= 0; i--) { arcs[i].t += dt; if (arcs[i].t > 1.2) arcs.splice(i, 1); }
+    flash = Math.max(0, flash - dt * 2.2);
+
+    // cursor + charging rock
+    const follow = Math.min(1, dt * 16);
+    ptr.sx += (ptr.x - ptr.sx) * follow; ptr.sy += (ptr.y - ptr.sy) * follow;
+    cursorSpin += dt * (charge ? 3 + charge.t * 2.5 : 1.1);
+    if (charge) {
+      charge.t += dt;
+      const k = Math.min(1, charge.t / GROW_TIME);
+      charge.size = MIN_ROCK + (MAX_ROCK - MIN_ROCK) * Math.pow(k, 0.85);
+      refreshCharge();
+      if (!charge.shaped) charge.rot += dt * 0.6;
+      if (!reduceMotion && k < 1) {
+        for (let j = 0; j < 3; j++) intake.push({ a: rand(0, TAU), r: charge.size + rand(30, 75), s: rand(0.7, 2), life: 0, sp: rand(1.5, 3.5) });
+      }
+    }
+    for (let i = intake.length - 1; i >= 0; i--) {
+      const p = intake[i];
+      p.life += dt;
+      p.r -= (40 + p.r * 2.2) * dt;
+      p.a += p.sp * dt;
+      if (!charge || p.r <= charge.size * 0.8) intake.splice(i, 1);
+    }
+    for (let i = bursts.length - 1; i >= 0; i--) { bursts[i].t += dt; if (bursts[i].t > 0.5) bursts.splice(i, 1); }
+
+    // ambient dust always drifting in
+    if (!reduceMotion) {
+      while (dust.length < DUST_MAX) dust.push(newDust(false));
+      for (let i = dust.length - 1; i >= 0; i--) {
+        const p = dust[i];
+        p.age += dt;
+        const ramp = Math.min(1, p.age / 3);
+        const boost = p.dist < R * 3.55 ? 2.4 : 1;
+        spiral(p, dt / 2, ramp, p.speed * boost);
+        spiral(p, dt / 2, ramp, p.speed * boost);
+        p.x = cx + Math.cos(p.ang) * p.dist; p.y = cy + Math.sin(p.ang) * p.dist;
+        p.heat = clamp((R * 3.4 / p.dist - 1) / 2.2, 0, 1);
+        p.trail.push(p.x, p.y); if (p.trail.length > 16) p.trail.splice(0, 2);
+        if (p.dist <= R) {
+          sparks.push({ x: p.x, y: p.y, t: 0, s: p.s });
+          dust[i] = newDust(false);
+        }
+      }
+    }
+    for (let i = sparks.length - 1; i >= 0; i--) { sparks[i].t += dt; if (sparks[i].t > 0.35) sparks.splice(i, 1); }
+
+    // slowly turning sky
+    if (!reduceMotion) {
+      for (const st of stars) st.ang += dt * 0.006 * (0.35 + st.depth);
+      for (const nb of nebulae) nb.ang += dt * 0.003;
+      meteorTimer -= dt;
+      if (meteorTimer <= 0) { meteorTimer = rand(3, 8); spawnMeteor(); }
+    }
+    updateMeteors(dt);
+  }
+
+  // ---------- draw ----------
+  function drawStars() {
+    const thE = R * 1.7;                      // Einstein radius: how strongly light bends
+    const thE2 = thE * thE;
+    for (const s of stars) {
+      s.dx = Math.cos(s.ang) * s.rad; s.dy = Math.sin(s.ang) * s.rad;
+      const d = Math.hypot(s.dx, s.dy) || 0.001;
+      const ux = s.dx / d, uy = s.dy / d;
+      const k = Math.sqrt(d * d + 4 * thE2);
+      const tw = reduceMotion ? 0.85 : 0.6 + 0.4 * Math.sin(time * s.sp + s.p);
+      const lens = thE2 / (d * d + thE2);
+
+      const d1 = (d + k) / 2;                 // primary image, pushed outward
+      const x1 = cx + ux * d1, y1 = cy + uy * d1;
+      if (x1 > -5 && x1 < W + 5 && y1 > -5 && y1 < H + 5) {
+        ctx.fillStyle = `rgba(${s.c},${Math.min(1, tw * (0.55 + lens * 1.2))})`;
+        const sz = s.s * (1 + lens * 0.8);
+        ctx.fillRect(x1 - sz / 2, y1 - sz / 2, sz, sz);
+      }
+      const d2 = (k - d) / 2;                 // faint mirror image on the far side
+      if (lens > 0.08 && d2 > R * 1.02) {
+        ctx.fillStyle = `rgba(${s.c},${tw * lens * lens * 0.9})`;
+        const sz = s.s * 0.8;
+        ctx.fillRect(cx - ux * d2 - sz / 2, cy - uy * d2 - sz / 2, sz, sz);
+      }
+    }
+  }
+
+  function drawNebulae() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const nb of nebulae) {
+      const breathe = 1 + 0.08 * Math.sin(time * nb.sp + nb.ph);
+      const x = cx + Math.cos(nb.ang) * nb.rad, y = cy + Math.sin(nb.ang) * nb.rad * 0.8;
+      const r = nb.size * breathe;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, `rgba(${nb.c},${nb.a})`);
+      g.addColorStop(0.5, `rgba(${nb.c},${nb.a * 0.4})`);
+      g.addColorStop(1, `rgba(${nb.c},0)`);
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawMeteors() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (const m of meteors) {
+      const t = m.trail, n = t.length / 2;
+      if (n < 2) continue;
+      const fadeIn = Math.min(1, m.t / 0.15), h = m.heat;
+      const cr = 255, cg = mix(245, 175, h) | 0, cb = mix(235, 90, h) | 0;
+      for (let i = 1; i < n; i++) {
+        const f = i / n;
+        ctx.strokeStyle = `rgba(${cr},${cg},${cb},${f * f * 0.85 * fadeIn})`;
+        ctx.lineWidth = 0.4 + f * (1.4 + h * 1.2);
+        ctx.beginPath(); ctx.moveTo(t[i * 2 - 2], t[i * 2 - 1]); ctx.lineTo(t[i * 2], t[i * 2 + 1]); ctx.stroke();
+      }
+      const hr = 2.2 + h * 2.5;
+      const g = ctx.createRadialGradient(m.x, m.y, 0, m.x, m.y, hr * 3);
+      g.addColorStop(0, `rgba(255,250,240,${fadeIn})`);
+      g.addColorStop(0.4, `rgba(${cr},${cg},${cb},${0.5 * fadeIn})`);
+      g.addColorStop(1, 'rgba(255,150,60,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(m.x, m.y, hr * 3, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawDust() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (const p of dust) {
+      const fade = Math.min(1, p.age / 2);
+      const h = p.heat;
+      const cr = mix(150 * p.g, 255, h) | 0, cg = mix(150 * p.g, 170, h) | 0, cb = mix(165 * p.g, 80, h) | 0;
+      const t = p.trail, n = t.length / 2;
+      if (n > 1) {
+        ctx.strokeStyle = `rgba(${cr},${cg},${cb},${(0.12 + h * 0.35) * fade})`;
+        ctx.lineWidth = p.s * 0.8;
+        ctx.beginPath(); ctx.moveTo(t[0], t[1]);
+        for (let i = 1; i < n; i++) ctx.lineTo(t[i * 2], t[i * 2 + 1]);
+        ctx.stroke();
+      }
+      ctx.fillStyle = `rgba(${cr},${cg},${cb},${(0.45 + h * 0.5) * fade})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.s * (1 + h * 0.4), 0, TAU); ctx.fill();
+    }
+    for (const sp of sparks) {
+      const inv = 1 - sp.t / 0.35, r = 3 + sp.s * 3 * (1 - inv);
+      const g = ctx.createRadialGradient(sp.x, sp.y, 0, sp.x, sp.y, r);
+      g.addColorStop(0, `rgba(255,240,210,${inv * 0.8})`); g.addColorStop(1, 'rgba(255,140,50,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(sp.x, sp.y, r, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawDisk() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+
+    // wide soft halo
+    let g = ctx.createRadialGradient(cx, cy, R * 0.9, cx, cy, R * 5.5);
+    g.addColorStop(0, 'rgba(255,140,50,0.22)');
+    g.addColorStop(0.35, 'rgba(255,90,30,0.07)');
+    g.addColorStop(1, 'rgba(255,60,20,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R * 5.5, 0, TAU); ctx.fill();
+
+    // main glowing ring
+    g = ctx.createRadialGradient(cx, cy, R, cx, cy, R * 3.6);
+    g.addColorStop(0, 'rgba(255,200,120,0)');
+    g.addColorStop(0.1, 'rgba(255,215,150,0.75)');
+    g.addColorStop(0.22, 'rgba(255,150,60,0.55)');
+    g.addColorStop(0.5, 'rgba(230,90,30,0.22)');
+    g.addColorStop(1, 'rgba(160,40,10,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R * 3.6, 0, TAU); ctx.fill();
+
+    // swirling streaks
+    ctx.lineCap = 'round';
+    for (const p of disk) {
+      const rr = p.r * R;
+      const shimmer = 0.75 + 0.25 * Math.sin(p.a * 3 + time * 0.7);
+      ctx.strokeStyle = diskColor(p.r, p.b * 0.42 * shimmer);
+      ctx.lineWidth = p.w * (R / 70);
+      ctx.beginPath(); ctx.arc(cx, cy, rr, p.a, p.a + p.len); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawTrails() {
+    ctx.save();
+    clipOutsideHorizon();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (const r of rocks) {
+      const cr = mix(140, 255, r.heat) | 0, cg = mix(150, 140, r.heat) | 0, cb = mix(175, 50, r.heat) | 0;
+      const share = r.trails.length > 1 ? 0.6 : 1;          // many emitters overlap, so each is softer
+      const w = Math.min(r.tw, 14) * (r.trails.length > 1 ? 0.8 : 0.7);
+      for (const t of r.trails) {
+        const n = t.length / 2;
+        for (let i = 1; i < n; i++) {
+          const f = i / n;
+          ctx.strokeStyle = `rgba(${cr},${cg},${cb},${f * f * (0.25 + r.heat * 0.5) * share})`;
+          ctx.lineWidth = f * w;
+          ctx.beginPath(); ctx.moveTo(t[i * 2 - 2], t[i * 2 - 1]); ctx.lineTo(t[i * 2], t[i * 2 + 1]); ctx.stroke();
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawRocks() {
+    if (charge) {
+      // warm glow along the whole shape being formed
+      ctx.save(); ctx.globalCompositeOperation = 'lighter';
+      const step = Math.max(1, Math.floor(charge.path.length / 12));
+      const pts = charge.shaped ? charge.path.filter((_, i) => i % step === 0) : [{ x: charge.x, y: charge.y }];
+      const gr = charge.size * (charge.shaped ? 2 : 2.6), al = charge.shaped ? 0.16 : 0.35;
+      for (const p of pts) {
+        const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, gr);
+        g.addColorStop(0, `rgba(255,170,80,${al})`); g.addColorStop(1, 'rgba(255,120,40,0)');
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, gr, 0, TAU); ctx.fill();
+      }
+      ctx.restore();
+    }
+    const list = charge ? rocks.concat([charge]) : rocks;
+    ctx.save();
+    clipOutsideHorizon();
+    for (const r of list) {
+      const { radial, outer, stretch } = rockGeom(r);
+      ctx.save();
+      ctx.translate(r.x, r.y);
+      ctx.rotate(radial);
+      ctx.translate(outer, 0);                        // anchor at the back edge
+      ctx.scale(stretch, 1 / Math.sqrt(stretch));     // pull the front toward the hole
+      ctx.translate(-outer, 0);
+      ctx.rotate(r.rot - radial);
+      const h = r.heat, s = r.shade;
+      const base = `rgb(${mix(110 * s, 255, h) | 0},${mix(100 * s, 150, h) | 0},${mix(92 * s, 60, h) | 0})`;
+      if (h > 0.15) { ctx.shadowColor = 'rgba(255,140,50,0.9)'; ctx.shadowBlur = 14 * h; }
+      ctx.fillStyle = base;
+      ctx.beginPath();
+      const pts = r.pts;
+      for (let i = 0; i < pts.length; i++) i ? ctx.lineTo(pts[i][0], pts[i][1]) : ctx.moveTo(pts[i][0], pts[i][1]);
+      ctx.closePath(); ctx.fill();
+      ctx.shadowBlur = 0;
+      // lighter inner face for a bit of volume
+      ctx.fillStyle = `rgba(255,${mix(220, 185, h) | 0},${mix(195, 100, h) | 0},${0.14 + h * 0.3})`;
+      ctx.save();
+      const off = Math.min(3, (r.hl || r.size) * 0.12);
+      ctx.translate(-off, -off); ctx.scale(0.66, 0.66);
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) i ? ctx.lineTo(pts[i][0], pts[i][1]) : ctx.moveTo(pts[i][0], pts[i][1]);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function clipOutsideHorizon() {
+    ctx.beginPath();
+    ctx.rect(0, 0, W, H);
+    ctx.arc(cx, cy, R, 0, TAU);
+    ctx.clip('evenodd');
+  }
+
+  function drawHole() {
+    // event horizon shadow
+    const g = ctx.createRadialGradient(cx, cy, R * 0.6, cx, cy, R * 1.12);
+    g.addColorStop(0, '#000');
+    g.addColorStop(0.82, '#000');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R * 1.12, 0, TAU); ctx.fill();
+
+    // photon ring
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const pulse = reduceMotion ? 0 : 0.08 * Math.sin(time * 1.6);
+    ctx.shadowColor = 'rgba(255,170,80,1)';
+    ctx.shadowBlur = 18 + flash * 30;
+    ctx.strokeStyle = `rgba(255,${210 + flash * 40 | 0},${150 + flash * 90 | 0},${0.7 + pulse + flash * 0.3})`;
+    ctx.lineWidth = 1.6 + flash * 2.5;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 1.04, 0, TAU); ctx.stroke();
+
+    // local glow along the horizon where a rock hit
+    for (const a of arcs) {
+      const f = 1 - a.t / 1.2;
+      const spread = (0.25 + a.t * 1.4) * (0.6 + a.size / 14);
+      ctx.shadowBlur = 24;
+      ctx.strokeStyle = `rgba(255,230,190,${f * 0.9})`;
+      ctx.lineWidth = (3 + a.size / 6) * f + 0.5;
+      ctx.beginPath(); ctx.arc(cx, cy, R * 1.03, a.a - spread, a.a + spread); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawImpacts() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const s of splashes) {
+      const f = s.t / 0.8, inv = 1 - f;
+      // bright flash at contact point
+      const fr = s.size * (2 + f * 6);
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, fr);
+      g.addColorStop(0, `rgba(255,255,240,${inv * inv})`);
+      g.addColorStop(0.35, `rgba(255,170,70,${inv * 0.7})`);
+      g.addColorStop(1, 'rgba(255,80,20,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(s.x, s.y, fr, 0, TAU); ctx.fill();
+      // expanding shock ring
+      ctx.strokeStyle = `rgba(255,200,130,${inv * 0.8})`;
+      ctx.lineWidth = 2 * inv + 0.4;
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.size * 1.5 + f * R * 0.7, 0, TAU); ctx.stroke();
+    }
+    for (const p of debris) {
+      const f = clamp(p.life / p.max, 0, 1);
+      ctx.fillStyle = p.hot > 0.5 ? `rgba(255,240,200,${f})` : `rgba(255,150,60,${f})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.s * (0.5 + f * 0.5), 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawCursor() {
+    if (!ptr.over && !charge) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    const x = charge ? ptr.x : ptr.sx, y = charge ? ptr.y : ptr.sy;
+    const k = charge ? Math.min(1, charge.t / GROW_TIME) : 0;
+    const full = charge && k >= 1;
+
+    // dust being pulled into the growing rock
+    if (charge) {
+      for (const p of intake) {
+        const a = Math.min(1, p.life * 5) * 0.9;
+        ctx.fillStyle = `rgba(255,${190 + (p.s * 20) | 0},120,${a})`;
+        ctx.beginPath(); ctx.arc(x + Math.cos(p.a) * p.r, y + Math.sin(p.a) * p.r, p.s, 0, TAU); ctx.fill();
+      }
+    }
+
+    // spinning reticle segments
+    const pulse = full ? 1 + 0.1 * Math.sin(time * 14) : 1;
+    const base = (charge ? Math.max(charge.size * (charge.shaped ? 0.85 : 1), 5) + 10 : 13) * pulse;
+    ctx.shadowColor = 'rgba(255,150,60,0.9)'; ctx.shadowBlur = charge ? 12 : 6;
+    ctx.strokeStyle = full ? 'rgba(255,235,200,0.95)' : `rgba(255,165,85,${charge ? 0.9 : 0.75})`;
+    ctx.lineWidth = 1.6;
+    for (let i = 0; i < 3; i++) {
+      const a0 = cursorSpin + (i * TAU) / 3;
+      ctx.beginPath(); ctx.arc(x, y, base, a0, a0 + (TAU / 3) * 0.55); ctx.stroke();
+    }
+    // counter-spinning outer ticks
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,190,120,0.45)';
+    for (let i = 0; i < 4; i++) {
+      const a = -cursorSpin * 0.7 + (i * TAU) / 4, r1 = base + 4, r2 = base + 8;
+      ctx.beginPath(); ctx.moveTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); ctx.lineTo(x + Math.cos(a) * r2, y + Math.sin(a) * r2); ctx.stroke();
+    }
+
+    if (charge) {
+      // size meter
+      const pr = base + 13;
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = 'rgba(255,255,255,0.1)'; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(x, y, pr, 0, TAU); ctx.stroke();
+      ctx.shadowBlur = 10;
+      ctx.strokeStyle = full ? 'rgba(255,245,225,1)' : 'rgba(255,160,70,0.95)';
+      ctx.beginPath(); ctx.arc(x, y, pr, -Math.PI / 2, -Math.PI / 2 + TAU * k); ctx.stroke();
+    } else {
+      ctx.shadowBlur = 8;
+      ctx.fillStyle = 'rgba(255,232,205,0.95)';
+      ctx.beginPath(); ctx.arc(ptr.x, ptr.y, 2, 0, TAU); ctx.fill();
+    }
+
+    ctx.restore();
+  }
+
+  function drawBursts() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const b of bursts) {
+      const f = b.t / 0.5, inv = 1 - f;
+      ctx.strokeStyle = `rgba(255,200,130,${inv * 0.9})`;
+      ctx.lineWidth = 2.5 * inv + 0.3;
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.size + 6 + f * (30 + b.size), 0, TAU); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now; time += dt;
+    update(dt);
+    ctx.fillStyle = '#02020a';
+    ctx.fillRect(0, 0, W, H);
+    drawNebulae();
+    drawStars();
+    drawDisk();
+    drawDust();
+    drawMeteors();
+    drawTrails();
+    drawRocks();
+    drawHole();
+    drawImpacts();
+    drawBursts();
+    drawCursor();
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- input ----------
+  cv.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+    ptr.type = e.pointerType; ptr.over = true;
+    ptr.x = ptr.sx = e.clientX; ptr.y = ptr.sy = e.clientY;
+    charge = {
+      path: [{ x: e.clientX, y: e.clientY, n1: Math.random(), n2: Math.random() }],
+      x: e.clientX, y: e.clientY, t: 0, size: MIN_ROCK, verts: makeRockShape(),
+      rot: rand(0, TAU), shade: rand(0.8, 1.15), heat: 0, shaped: false, pts: [], hl: MIN_ROCK
+    };
+    refreshCharge();
+  });
+  cv.addEventListener('pointermove', e => {
+    ptr.x = e.clientX; ptr.y = e.clientY;
+    if (e.pointerType === 'mouse') ptr.over = true;
+    if (charge) {
+      const path = charge.path, last = path[path.length - 1];
+      const maxLen = Math.min(340, Math.min(W, H) * 0.5);
+      if (Math.hypot(ptr.x - last.x, ptr.y - last.y) >= 5 && pathLength(path) < maxLen) {
+        path.push({ x: ptr.x, y: ptr.y, n1: Math.random(), n2: Math.random() });
+        refreshCharge();
+      }
+    }
+  });
+  cv.addEventListener('pointerenter', e => { ptr.x = ptr.sx = e.clientX; ptr.y = ptr.sy = e.clientY; if (e.pointerType === 'mouse') ptr.over = true; });
+  cv.addEventListener('pointerleave', () => { if (!charge) ptr.over = false; });
+  function release() {
+    if (!charge) return;
+    refreshCharge();
+    spawnRock(charge.x, charge.y, charge.hl, charge.pts, charge.rot, charge.shade);
+    Object.assign(rocks[rocks.length - 1], { hl: charge.hl, emit: charge.emit, tw: charge.tw });
+    bursts.push({ x: charge.x, y: charge.y, t: 0, size: charge.hl });
+    charge = null; intake.length = 0;
+    if (ptr.type !== 'mouse') ptr.over = false;
+  }
+  cv.addEventListener('pointerup', release);
+  cv.addEventListener('pointercancel', release);
+  sizeIn.addEventListener('input', () => { targetR = +sizeIn.value; sizeOut.textContent = targetR; });
+  spinIn.addEventListener('input', () => { spin = +spinIn.value; spinOut.textContent = spin.toFixed(1) + '×'; });
+  addEventListener('resize', resize);
+
+  resize(); makeDisk();
+  R = targetR;
+  if (!reduceMotion) for (let i = 0; i < DUST_MAX; i++) dust.push(newDust(true));
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
